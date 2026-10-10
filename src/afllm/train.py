@@ -10,7 +10,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from afllm.checkpoint import find_latest_checkpoint, load_checkpoint, save_checkpoint
+from afllm.checkpoint import (
+    build_run_metadata,
+    check_resume_compatibility,
+    find_latest_checkpoint,
+    load_checkpoint,
+    save_checkpoint,
+)
 from afllm.config import ExperimentConfig
 from afllm.env_checks import verify_training_paths
 from afllm.evaluate import evaluate
@@ -65,7 +71,17 @@ def train(cfg: ExperimentConfig, train_loader, val_loader, log_fn=print) -> dict
         if latest is not None:
             state = load_checkpoint(latest, model, optimizer, map_location=device)
             start_step = state["step"] + 1
-            log_fn({"event": "resumed", "from_checkpoint": str(latest), "step": start_step})
+            # Surface config-mismatch status explicitly rather than
+            # silently treating any resume as a verified exact one - see
+            # afllm.checkpoint.check_resume_compatibility for what counts
+            # as a critical mismatch vs. a benign environment difference.
+            compatibility = check_resume_compatibility(state.get("extra"), cfg)
+            log_fn({
+                "event": "resumed",
+                "from_checkpoint": str(latest),
+                "step": start_step,
+                "resume_compatibility": compatibility,
+            })
 
     Path(cfg.train.log_dir).mkdir(parents=True, exist_ok=True)
     last_log: dict = {}
@@ -115,12 +131,21 @@ def train(cfg: ExperimentConfig, train_loader, val_loader, log_fn=print) -> dict
 
         if step % cfg.train.eval_interval == 0 or step == cfg.train.max_steps - 1:
             metrics = evaluate(model, val_loader, device, max_steps=cfg.train.eval_steps)
-            last_log["val_loss"] = metrics["loss"]
-            last_log["val_perplexity"] = metrics["perplexity"]
+            if metrics["valid"]:
+                last_log["val_loss"] = metrics["loss"]
+                last_log["val_perplexity"] = metrics["perplexity"]
+            else:
+                # Never let an invalid eval (e.g. empty validation set)
+                # flow into logs as NaN - record an explicit status instead
+                # of a number that looks real but isn't.
+                last_log["val_status"] = "no_validation_data"
 
         log_fn(last_log)
 
         if step % cfg.train.checkpoint_interval == 0 or step == cfg.train.max_steps - 1:
-            save_checkpoint(cfg.train.checkpoint_dir, step, model, optimizer)
+            save_checkpoint(
+                cfg.train.checkpoint_dir, step, model, optimizer,
+                extra=build_run_metadata(cfg, step),
+            )
 
     return last_log
