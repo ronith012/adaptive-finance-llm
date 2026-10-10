@@ -19,9 +19,12 @@ component-by-component comparison and why these are not interchangeable.
 
 ## Status
 
-Baseline PyTorch decoder-only transformer, config-driven training loop,
-checkpoint recovery, and a first (preliminary) WikiText-2 smoke test. No
-architectural or financial-reasoning claims yet.
+Baseline PyTorch decoder-only transformer, config-driven training loop, and
+checkpoint recovery, validated by a pipeline smoke test (`scripts/smoke_test.py`)
+and a unit test suite — not yet by a real training run. The one WikiText-2
+data point in `docs/experiments/` is from a prior, separate architecture;
+see the note at the top of that file. No architectural or
+financial-reasoning claims yet.
 
 ## Repository layout
 
@@ -35,9 +38,10 @@ src/afllm/               Library code
   evaluate.py              Validation loop (loss, perplexity)
   checkpoint.py            Save/load/resume checkpoint utilities, incl. RNG state
   env_checks.py            Google Drive mount verification (fail loudly, not silently)
-scripts/train.py          CLI entrypoint
-scripts/colab_quickstart.ipynb   Colab notebook (mounts Drive, runs training)
-tests/                   pytest suite (model, config, checkpoint, env checks — no network needed)
+scripts/train.py          CLI entrypoint for real training
+scripts/smoke_test.py     Fast, network-free pipeline check (init/forward/backward/checkpoint)
+scripts/colab_quickstart.ipynb   Colab notebook (mounts Drive, smoke test, then training)
+tests/                   pytest suite (model, config, checkpoint, env checks, smoke test — no network needed)
 docs/architecture_notes.md   What this model is vs. the original Colab baseline
 docs/experiments/        Experiment write-ups, explicitly labeled preliminary/final
 ```
@@ -71,6 +75,15 @@ These tests do not download any dataset or model weights; they use small
 random tensors and tiny model configs.
 
 ## Training (Colab)
+
+Run the smoke test first — it catches a broken CUDA/torch install or a
+Drive permissions problem in seconds, before a long run depends on them:
+
+```bash
+python scripts/smoke_test.py --device cuda --checkpoint-dir /content/drive/MyDrive/adaptive-finance-llm/smoke_test
+```
+
+Then:
 
 ```bash
 python scripts/train.py --config configs/baseline_small.yaml
