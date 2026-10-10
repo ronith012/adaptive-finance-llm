@@ -62,9 +62,20 @@ def _restore_rng_state(state: dict | None) -> None:
     if "numpy" in state:
         np.random.set_state(state["numpy"])
     if "torch_cpu" in state:
-        torch.set_rng_state(state["torch_cpu"])
+        # torch.set_rng_state requires a CPU torch.ByteTensor regardless of
+        # the device training runs on. If this checkpoint was loaded with
+        # map_location pointed at a CUDA device, torch.load moves every
+        # tensor in the pickle - including this one - onto that device,
+        # which then makes this call raise
+        # "TypeError: RNG state must be a torch.ByteTensor". Force it back
+        # to CPU here so restoration works no matter what map_location the
+        # caller used to load the rest of the checkpoint.
+        torch.set_rng_state(state["torch_cpu"].cpu())
     if "torch_cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["torch_cuda"])
+        # Same reasoning as above, per-device: torch.cuda.set_rng_state_all
+        # also expects each entry to be a CPU ByteTensor (it is itself
+        # responsible for applying it to the right CUDA device).
+        torch.cuda.set_rng_state_all([t.cpu() for t in state["torch_cuda"]])
 
 
 def save_checkpoint(
