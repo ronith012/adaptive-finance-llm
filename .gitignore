@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# Data, checkpoints, logs — these live on Google Drive, never in git
+data/
+checkpoints/
+logs/
+runs/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Local env
+.env
