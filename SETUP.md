@@ -97,6 +97,13 @@ the Colab session itself.
    !python scripts/train.py --config configs/baseline_small.yaml
    ```
 
+   `train.device: cuda` (the config default) now fails immediately and
+   clearly if CUDA isn't actually available in the runtime, instead of
+   silently training on CPU for hours unnoticed - if you see a
+   `CudaNotAvailableError`, select a GPU runtime (Runtime > Change runtime
+   type) and re-run. Set `train.device: cpu` in the config for an
+   intentional CPU-only run; that is always honored as-is.
+
 6. **Resuming after a disconnect**: training auto-resumes from the latest
    checkpoint in `train.checkpoint_dir` when `train.resume: true` (the
    default). Just re-run the same command after remounting Drive.

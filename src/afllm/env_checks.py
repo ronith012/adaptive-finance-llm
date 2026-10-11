@@ -13,11 +13,40 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+import torch
+
 DRIVE_MOUNT_ROOT = "/content/drive"
 
 
 class StorageNotMountedError(RuntimeError):
     pass
+
+
+class CudaNotAvailableError(RuntimeError):
+    pass
+
+
+def resolve_device(requested_device: str) -> str:
+    """Resolve `train.device`, failing loudly if CUDA was explicitly
+    requested but isn't available - instead of silently training on CPU,
+    which makes an intended fast GPU run appear to "work" while actually
+    running orders of magnitude slower (or never finishing in the
+    expected time), often unnoticed until much later.
+
+    A `requested_device` that does not start with "cuda" (e.g. "cpu") is
+    returned unchanged and never second-guessed: intentional CPU-only
+    operation is always honored as configured.
+    """
+    if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        raise CudaNotAvailableError(
+            f"train.device={requested_device!r} but CUDA is not available "
+            f"in this environment (torch.cuda.is_available() is False). "
+            f"Set train.device: cpu in your config for intentional "
+            f"CPU-only operation, or fix the CUDA/driver/runtime setup "
+            f"(e.g. select a GPU runtime in Colab: Runtime > Change "
+            f"runtime type)."
+        )
+    return requested_device
 
 
 def _is_under(path: Path, root: Path) -> bool:

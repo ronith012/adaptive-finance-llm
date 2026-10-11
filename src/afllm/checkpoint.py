@@ -1,10 +1,17 @@
 """Checkpoint save/load and recovery.
 
 Checkpoints are plain `torch.save` dicts containing model, optimizer,
-scheduler, RNG, and step state, written to `TrainConfig.checkpoint_dir`
-(a Google Drive path in the Colab workflow). `find_latest_checkpoint`
-lets training resume after a Colab disconnect without re-running
-from step 0.
+scheduler, AMP GradScaler, RNG, and step state, written to
+`TrainConfig.checkpoint_dir` (a Google Drive path in the Colab workflow).
+`find_latest_checkpoint` lets training resume after a Colab disconnect
+without re-running from step 0.
+
+GradScaler state (the AMP loss-scale value and its growth/backoff
+bookkeeping) is saved/restored the same optional, additive way as
+`scheduler`: pass `scaler=` to `save_checkpoint`/`load_checkpoint` and it
+round-trips; omit it (or load an older checkpoint saved before this
+existed) and nothing breaks - there is simply no scaler state to restore,
+same as today's behavior.
 
 Reproducibility scope: saving/restoring Python's `random`, NumPy, and
 PyTorch (CPU + CUDA) RNG states means that, from the restored step onward,
@@ -215,6 +222,7 @@ def save_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: Any = None,
+    scaler: torch.cuda.amp.GradScaler | None = None,
     extra: dict | None = None,
 ) -> Path:
     checkpoint_dir = Path(checkpoint_dir)
@@ -224,6 +232,10 @@ def save_checkpoint(
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        # GradScaler.state_dict() returns {} when the scaler is disabled
+        # (e.g. CPU-only or amp=False) - saved as {} rather than None in
+        # that case, which load_checkpoint treats as "nothing to restore".
+        "scaler": scaler.state_dict() if scaler is not None else None,
         "rng_state": _capture_rng_state(),
         "extra": extra or {},
     }
@@ -254,6 +266,7 @@ def load_checkpoint(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer | None = None,
     scheduler: Any = None,
+    scaler: torch.cuda.amp.GradScaler | None = None,
     map_location: str = "cpu",
     restore_rng: bool = True,
 ) -> dict:
@@ -270,6 +283,13 @@ def load_checkpoint(
         optimizer.load_state_dict(state["optimizer"])
     if scheduler is not None and state.get("scheduler") is not None:
         scheduler.load_state_dict(state["scheduler"])
+    if scaler is not None and state.get("scaler"):
+        # Truthy check (not "is not None"): GradScaler.state_dict() saves
+        # {} when the scaler was disabled, and GradScaler.load_state_dict
+        # on an empty dict is a no-op anyway - this just skips the call
+        # entirely for clarity, and also naturally skips checkpoints saved
+        # before scaler support existed (state.get("scaler") is None there).
+        scaler.load_state_dict(state["scaler"])
     if restore_rng:
         _restore_rng_state(state.get("rng_state"))
     return state
