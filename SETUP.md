@@ -97,6 +97,13 @@ the Colab session itself.
    !python scripts/train.py --config configs/baseline_small.yaml
    ```
 
+   `train.device: cuda` (the config default) now fails immediately and
+   clearly if CUDA isn't actually available in the runtime, instead of
+   silently training on CPU for hours unnoticed - if you see a
+   `CudaNotAvailableError`, select a GPU runtime (Runtime > Change runtime
+   type) and re-run. Set `train.device: cpu` in the config for an
+   intentional CPU-only run; that is always honored as-is.
+
 6. **Resuming after a disconnect**: training auto-resumes from the latest
    checkpoint in `train.checkpoint_dir` when `train.resume: true` (the
    default). Just re-run the same command after remounting Drive.
@@ -115,8 +122,42 @@ the Colab session itself.
    `DataLoader` iterator restarts from the beginning of a fresh shuffle
    rather than being fast-forwarded to its exact in-epoch position, and
    `num_workers > 0` worker RNG seeding isn't currently pinned to the
-   checkpointed state. A resumed run is valid but not bit-reproducible
-   against a never-interrupted one.
+   checkpointed state. **This remains true after the reproducibility work
+   below — it has not been changed or fixed, only documented more
+   precisely.** A resumed run is valid but not bit-reproducible against a
+   never-interrupted one. Do not claim exact continuation; nothing in this
+   codebase currently restores exact data order across a resume.
+
+   **Config-mismatch detection on resume:** every checkpoint now records
+   the full config, seed, and installed library versions that produced it
+   (`afllm.checkpoint.build_run_metadata`). On resume, `train()` compares
+   the checkpoint's saved config against the one you're resuming with
+   (`afllm.checkpoint.check_resume_compatibility`) for the fields that
+   actually affect reproducibility — model architecture, dataset/tokenizer
+   identity, seed, LR schedule, batching — and logs one of `"match"`,
+   `"mismatch"` (with the specific fields that differ), or `"no_metadata"`
+   (a checkpoint saved before this feature existed). This is a visibility
+   tool, not a guardrail: it warns, it does not block a resume, and
+   operational fields like `checkpoint_dir`/`log_dir` are deliberately
+   excluded since they legitimately differ across environments.
+
+## Recommended pinned environment
+
+`requirements.txt` intentionally uses `>=` lower bounds, not exact pins, so
+nothing here is pinned yet. The only environment actually validated end to
+end on real GPU hardware so far: **PyTorch 2.11.0+cu130 on a Tesla T4**
+(the Colab run that validated the smoke test and the RNG-restoration fix).
+`transformers`/`datasets`/`tokenizers` versions for that run were not
+captured at the time — they were installed unpinned — so they cannot be
+honestly reported here.
+
+Going forward, every checkpoint's `extra["environment"]` dict (via
+`afllm.checkpoint.capture_environment_versions`) now records the installed
+`torch`, `cuda`, `transformers`, `datasets`, and `tokenizers` versions for
+the run that produced it. The next time a full validated run completes,
+pull that dict from its checkpoint and turn it into an exact-pinned
+`requirements-validated.txt` (or equivalent) — don't guess at version
+numbers, read them from an actual validated run's own metadata.
 
 ## What never happens locally
 

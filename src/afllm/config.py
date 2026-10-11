@@ -25,7 +25,10 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    dataset_name: str = "wikitext"
+    # "Salesforce/wikitext": the bare "wikitext" repo id relied on a
+    # script-based HF `datasets` loader that has since been deprecated/
+    # removed on the Hub in favor of this namespaced, data-only repo.
+    dataset_name: str = "Salesforce/wikitext"
     dataset_config: str = "wikitext-2-raw-v1"
     tokenizer_name: str = "gpt2"
     cache_dir: str = "/content/drive/MyDrive/adaptive-finance-llm/data"
@@ -107,4 +110,52 @@ def validate_vocab_size(cfg: ExperimentConfig, tokenizer_vocab_size: int) -> Non
             f"'{cfg.data.tokenizer_name}'. Update model.vocab_size in your "
             f"config to {tokenizer_vocab_size}, or token ids from this "
             f"tokenizer will index outside the embedding table at runtime."
+        )
+
+
+class TrainConfigError(ValueError):
+    pass
+
+
+def _describe_positive_int_error(name: str, value: Any) -> str | None:
+    """Return an error string if `value` isn't a positive `int`, else None.
+
+    Checks type before magnitude: `grad_accum_steps = 1.5` would otherwise
+    pass a bare `value < 1` check and only fail much later, inside the
+    training loop, as a confusing `TypeError` from `range(1.5)`. `bool` is
+    explicitly excluded even though it's technically an `int` subclass in
+    Python (`True == 1`, `False == 0`) - a step count of `True`/`False`
+    is never a meaningful config value, regardless of what it compares
+    equal to.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return f"train.{name} must be a positive integer, got {value!r} ({type(value).__name__})"
+    if value < 1:
+        return f"train.{name} must be >= 1, got {value}"
+    return None
+
+
+def validate_train_config(cfg: ExperimentConfig) -> None:
+    """Fail loudly on training hyperparameters that would otherwise crash
+    deep inside the training loop with a confusing error, or silently do
+    nothing useful.
+
+    Specifically: `step % eval_interval` and `step % checkpoint_interval`
+    raise `ZeroDivisionError` if either is 0; `grad_accum_steps < 1` makes
+    the accumulation loop a no-op (zero backward passes, optimizer.step()
+    on empty gradients); `max_steps < 1` makes the training loop a silent
+    no-op; and any of these four as a non-`int` (a fractional float, or a
+    `bool`) eventually crashes `range(...)` deep in the training loop with
+    a confusing `TypeError` rather than a clear config error. Call this
+    before entering the training loop.
+    """
+    errors = []
+    for name in ("grad_accum_steps", "eval_interval", "checkpoint_interval", "max_steps"):
+        error = _describe_positive_int_error(name, getattr(cfg.train, name))
+        if error is not None:
+            errors.append(error)
+
+    if errors:
+        raise TrainConfigError(
+            "Invalid training configuration:\n  - " + "\n  - ".join(errors)
         )
