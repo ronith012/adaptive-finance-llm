@@ -1,17 +1,42 @@
+from pathlib import Path
+
 import pytest
 
 from afllm.config import (
+    DataConfig,
     ExperimentConfig,
     VocabSizeMismatchError,
     load_config,
     validate_vocab_size,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
 
 def test_default_config_constructs():
     cfg = ExperimentConfig()
     assert cfg.model.dim == 256
     assert cfg.train.max_steps == 500
+
+
+def test_default_dataset_uses_namespaced_salesforce_repo_id():
+    # The bare "wikitext" repo id relied on a script-based HF `datasets`
+    # loader that was deprecated/removed on the Hub; "Salesforce/wikitext"
+    # is the namespaced, data-only replacement repo for the same dataset.
+    cfg = DataConfig()
+    assert cfg.dataset_name == "Salesforce/wikitext"
+    assert cfg.dataset_config == "wikitext-2-raw-v1"  # unchanged, preserved
+
+
+def test_cache_dir_remains_configurable_not_hardcoded():
+    cfg = DataConfig(cache_dir="/some/custom/path")
+    assert cfg.cache_dir == "/some/custom/path"
+
+
+def test_baseline_small_yaml_uses_salesforce_wikitext_repo_id():
+    cfg = load_config(REPO_ROOT / "configs" / "baseline_small.yaml")
+    assert cfg.data.dataset_name == "Salesforce/wikitext"
+    assert cfg.data.dataset_config == "wikitext-2-raw-v1"
 
 
 def test_load_config_overrides(tmp_path):

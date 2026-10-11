@@ -12,7 +12,7 @@ model:
   tie_embeddings: true
 
 data:
-  dataset_name: wikitext
+  dataset_name: Salesforce/wikitext
   dataset_config: wikitext-2-raw-v1
   tokenizer_name: gpt2
   cache_dir: /content/drive/MyDrive/adaptive-finance-llm/data
