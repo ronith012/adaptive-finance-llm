@@ -223,3 +223,86 @@ def test_load_checkpoint_backward_compatible_without_rng_state(tmp_path):
     state = load_checkpoint(path, model2, optimizer2)  # must not raise
 
     assert state["step"] == 3
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="GradScaler forcibly disables itself (state_dict() == {}) when CUDA "
+    "is unavailable, regardless of enabled=True, so a non-trivial enabled "
+    "scaler state can only be exercised on real CUDA hardware",
+)
+def test_scaler_state_round_trips(tmp_path):
+    model = tiny_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    # Non-default construction args so this scaler's state is clearly
+    # different from a freshly-constructed default GradScaler's state -
+    # proves restoration actually happened, not just "defaults match
+    # defaults".
+    scaler = torch.cuda.amp.GradScaler(
+        init_scale=2.0 ** 5, growth_factor=1.5, backoff_factor=0.25,
+        growth_interval=50, enabled=True,
+    )
+    original_state = scaler.state_dict()
+
+    path = save_checkpoint(tmp_path, step=0, model=model, optimizer=optimizer, scaler=scaler)
+
+    model2 = tiny_model()
+    optimizer2 = torch.optim.AdamW(model2.parameters(), lr=1e-3)
+    scaler2 = torch.cuda.amp.GradScaler(enabled=True)  # plain defaults
+    assert scaler2.state_dict() != original_state, (
+        "test setup invalid: default scaler already matches the non-default one"
+    )
+
+    load_checkpoint(path, model2, optimizer2, scaler=scaler2)
+
+    assert scaler2.state_dict() == original_state
+
+
+def test_scaler_disabled_round_trip_is_a_no_op(tmp_path):
+    """On CPU-only training, the scaler is constructed with enabled=False;
+    its state_dict() is {} and restoring it must not raise or do anything
+    surprising."""
+    model = tiny_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scaler = torch.cuda.amp.GradScaler(enabled=False)
+
+    path = save_checkpoint(tmp_path, step=0, model=model, optimizer=optimizer, scaler=scaler)
+
+    model2 = tiny_model()
+    optimizer2 = torch.optim.AdamW(model2.parameters(), lr=1e-3)
+    scaler2 = torch.cuda.amp.GradScaler(enabled=False)
+
+    load_checkpoint(path, model2, optimizer2, scaler=scaler2)  # must not raise
+    assert scaler2.state_dict() == {}
+
+
+def test_load_checkpoint_backward_compatible_without_scaler_key(tmp_path):
+    """A checkpoint saved before scaler-state capture existed (no "scaler"
+    key at all) must still load without raising, even when a real scaler
+    is passed in to be restored."""
+    model = tiny_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    legacy_state = {
+        "step": 4,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": None,
+        "extra": {},
+    }
+    path = tmp_path / "ckpt_step4.pt"
+    torch.save(legacy_state, path)
+
+    model2 = tiny_model()
+    optimizer2 = torch.optim.AdamW(model2.parameters(), lr=1e-3)
+    scaler2 = torch.cuda.amp.GradScaler(
+        init_scale=2.0 ** 5, growth_factor=1.5, backoff_factor=0.25,
+        growth_interval=50, enabled=True,
+    )
+    pre_load_state = scaler2.state_dict()
+
+    state = load_checkpoint(path, model2, optimizer2, scaler=scaler2)  # must not raise
+
+    assert state["step"] == 4
+    # Nothing to restore from this legacy checkpoint - scaler2 untouched.
+    assert scaler2.state_dict() == pre_load_state
