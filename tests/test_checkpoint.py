@@ -1,3 +1,4 @@
+import dataclasses
 import random
 
 import numpy as np
@@ -6,11 +7,13 @@ import torch
 
 from afllm.checkpoint import (
     _restore_rng_state,
+    build_run_metadata,
+    check_resume_compatibility,
     find_latest_checkpoint,
     load_checkpoint,
     save_checkpoint,
 )
-from afllm.config import ModelConfig
+from afllm.config import ExperimentConfig, ModelConfig
 from afllm.model import TransformerLM
 
 
@@ -223,3 +226,113 @@ def test_load_checkpoint_backward_compatible_without_rng_state(tmp_path):
     state = load_checkpoint(path, model2, optimizer2)  # must not raise
 
     assert state["step"] == 3
+
+
+def test_save_checkpoint_persists_run_metadata(tmp_path):
+    model = tiny_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    cfg = ExperimentConfig()
+
+    path = save_checkpoint(
+        tmp_path, step=7, model=model, optimizer=optimizer,
+        extra=build_run_metadata(cfg, step=7),
+    )
+    state = torch.load(path, weights_only=False)
+
+    extra = state["extra"]
+    assert extra["config"]["train"]["seed"] == cfg.train.seed
+    assert extra["config"]["model"]["dim"] == cfg.model.dim
+    assert extra["seed"] == cfg.train.seed
+    assert extra["step"] == 7
+    assert extra["dataset_name"] == cfg.data.dataset_name
+    assert extra["tokenizer_name"] == cfg.data.tokenizer_name
+    assert "torch" in extra["environment"]
+    assert "cuda_available" in extra["environment"]
+
+
+def test_check_resume_compatibility_match():
+    cfg = ExperimentConfig()
+    extra = build_run_metadata(cfg, step=0)
+
+    result = check_resume_compatibility(extra, cfg)
+
+    assert result == {"status": "match"}
+
+
+def test_check_resume_compatibility_detects_mismatch():
+    cfg = ExperimentConfig()
+    extra = build_run_metadata(cfg, step=0)
+
+    changed_train = dataclasses.replace(cfg.train, seed=cfg.train.seed + 1, lr=cfg.train.lr * 2)
+    changed_cfg = dataclasses.replace(cfg, train=changed_train)
+
+    result = check_resume_compatibility(extra, changed_cfg)
+
+    assert result["status"] == "mismatch"
+    joined = " ".join(result["mismatches"])
+    assert "train.seed" in joined
+    assert "train.lr" in joined
+
+
+def test_check_resume_compatibility_detects_dropout_mismatch():
+    cfg = ExperimentConfig()
+    extra = build_run_metadata(cfg, step=0)
+
+    changed_model = dataclasses.replace(cfg.model, dropout=cfg.model.dropout + 0.1)
+    changed_cfg = dataclasses.replace(cfg, model=changed_model)
+
+    result = check_resume_compatibility(extra, changed_cfg)
+
+    assert result["status"] == "mismatch"
+    assert any("model.dropout" in m for m in result["mismatches"])
+
+
+def test_check_resume_compatibility_detects_weight_decay_mismatch():
+    cfg = ExperimentConfig()
+    extra = build_run_metadata(cfg, step=0)
+
+    changed_train = dataclasses.replace(cfg.train, weight_decay=cfg.train.weight_decay + 0.05)
+    changed_cfg = dataclasses.replace(cfg, train=changed_train)
+
+    result = check_resume_compatibility(extra, changed_cfg)
+
+    assert result["status"] == "mismatch"
+    assert any("train.weight_decay" in m for m in result["mismatches"])
+
+
+def test_check_resume_compatibility_detects_grad_clip_mismatch():
+    cfg = ExperimentConfig()
+    extra = build_run_metadata(cfg, step=0)
+
+    changed_train = dataclasses.replace(cfg.train, grad_clip=cfg.train.grad_clip + 1.0)
+    changed_cfg = dataclasses.replace(cfg, train=changed_train)
+
+    result = check_resume_compatibility(extra, changed_cfg)
+
+    assert result["status"] == "mismatch"
+    assert any("train.grad_clip" in m for m in result["mismatches"])
+
+
+def test_check_resume_compatibility_ignores_operational_fields():
+    """Changing checkpoint_dir/log_dir (legitimately different across
+    environments/sessions) must not be reported as a mismatch."""
+    cfg = ExperimentConfig()
+    extra = build_run_metadata(cfg, step=0)
+
+    changed_train = dataclasses.replace(
+        cfg.train, checkpoint_dir="/some/other/path", log_dir="/another/path"
+    )
+    changed_cfg = dataclasses.replace(cfg, train=changed_train)
+
+    result = check_resume_compatibility(extra, changed_cfg)
+
+    assert result == {"status": "match"}
+
+
+def test_check_resume_compatibility_no_metadata_for_legacy_checkpoint():
+    cfg = ExperimentConfig()
+
+    assert check_resume_compatibility(None, cfg) == {"status": "no_metadata"}
+    # "extra" present (as every checkpoint has always had) but without a
+    # "config" key - i.e. a checkpoint saved before this feature existed.
+    assert check_resume_compatibility({}, cfg) == {"status": "no_metadata"}
