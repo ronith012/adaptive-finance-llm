@@ -25,7 +25,10 @@ class ModelConfig:
 
 @dataclass
 class DataConfig:
-    dataset_name: str = "wikitext"
+    # "Salesforce/wikitext": the bare "wikitext" repo id relied on a
+    # script-based HF `datasets` loader that has since been deprecated/
+    # removed on the Hub in favor of this namespaced, data-only repo.
+    dataset_name: str = "Salesforce/wikitext"
     dataset_config: str = "wikitext-2-raw-v1"
     tokenizer_name: str = "gpt2"
     cache_dir: str = "/content/drive/MyDrive/adaptive-finance-llm/data"
