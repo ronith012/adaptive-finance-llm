@@ -1,3 +1,4 @@
+import dataclasses
 import random
 
 import numpy as np
@@ -6,11 +7,13 @@ import torch
 
 from afllm.checkpoint import (
     _restore_rng_state,
+    build_run_metadata,
+    check_resume_compatibility,
     find_latest_checkpoint,
     load_checkpoint,
     save_checkpoint,
 )
-from afllm.config import ModelConfig
+from afllm.config import ExperimentConfig, ModelConfig
 from afllm.model import TransformerLM
 
 
@@ -223,3 +226,196 @@ def test_load_checkpoint_backward_compatible_without_rng_state(tmp_path):
     state = load_checkpoint(path, model2, optimizer2)  # must not raise
 
     assert state["step"] == 3
+
+
+def test_save_checkpoint_persists_run_metadata(tmp_path):
+    model = tiny_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    cfg = ExperimentConfig()
+
+    path = save_checkpoint(
+        tmp_path, step=7, model=model, optimizer=optimizer,
+        extra=build_run_metadata(cfg, step=7),
+    )
+    state = torch.load(path, weights_only=False)
+
+    extra = state["extra"]
+    assert extra["config"]["train"]["seed"] == cfg.train.seed
+    assert extra["config"]["model"]["dim"] == cfg.model.dim
+    assert extra["seed"] == cfg.train.seed
+    assert extra["step"] == 7
+    assert extra["dataset_name"] == cfg.data.dataset_name
+    assert extra["tokenizer_name"] == cfg.data.tokenizer_name
+    assert "torch" in extra["environment"]
+    assert "cuda_available" in extra["environment"]
+
+
+def test_check_resume_compatibility_match():
+    cfg = ExperimentConfig()
+    extra = build_run_metadata(cfg, step=0)
+
+    result = check_resume_compatibility(extra, cfg)
+
+    assert result == {"status": "match"}
+
+
+def test_check_resume_compatibility_detects_mismatch():
+    cfg = ExperimentConfig()
+    extra = build_run_metadata(cfg, step=0)
+
+    changed_train = dataclasses.replace(cfg.train, seed=cfg.train.seed + 1, lr=cfg.train.lr * 2)
+    changed_cfg = dataclasses.replace(cfg, train=changed_train)
+
+    result = check_resume_compatibility(extra, changed_cfg)
+
+    assert result["status"] == "mismatch"
+    joined = " ".join(result["mismatches"])
+    assert "train.seed" in joined
+    assert "train.lr" in joined
+
+
+def test_check_resume_compatibility_detects_dropout_mismatch():
+    cfg = ExperimentConfig()
+    extra = build_run_metadata(cfg, step=0)
+
+    changed_model = dataclasses.replace(cfg.model, dropout=cfg.model.dropout + 0.1)
+    changed_cfg = dataclasses.replace(cfg, model=changed_model)
+
+    result = check_resume_compatibility(extra, changed_cfg)
+
+    assert result["status"] == "mismatch"
+    assert any("model.dropout" in m for m in result["mismatches"])
+
+
+def test_check_resume_compatibility_detects_weight_decay_mismatch():
+    cfg = ExperimentConfig()
+    extra = build_run_metadata(cfg, step=0)
+
+    changed_train = dataclasses.replace(cfg.train, weight_decay=cfg.train.weight_decay + 0.05)
+    changed_cfg = dataclasses.replace(cfg, train=changed_train)
+
+    result = check_resume_compatibility(extra, changed_cfg)
+
+    assert result["status"] == "mismatch"
+    assert any("train.weight_decay" in m for m in result["mismatches"])
+
+
+def test_check_resume_compatibility_detects_grad_clip_mismatch():
+    cfg = ExperimentConfig()
+    extra = build_run_metadata(cfg, step=0)
+
+    changed_train = dataclasses.replace(cfg.train, grad_clip=cfg.train.grad_clip + 1.0)
+    changed_cfg = dataclasses.replace(cfg, train=changed_train)
+
+    result = check_resume_compatibility(extra, changed_cfg)
+
+    assert result["status"] == "mismatch"
+    assert any("train.grad_clip" in m for m in result["mismatches"])
+
+
+def test_check_resume_compatibility_ignores_operational_fields():
+    """Changing checkpoint_dir/log_dir (legitimately different across
+    environments/sessions) must not be reported as a mismatch."""
+    cfg = ExperimentConfig()
+    extra = build_run_metadata(cfg, step=0)
+
+    changed_train = dataclasses.replace(
+        cfg.train, checkpoint_dir="/some/other/path", log_dir="/another/path"
+    )
+    changed_cfg = dataclasses.replace(cfg, train=changed_train)
+
+    result = check_resume_compatibility(extra, changed_cfg)
+
+    assert result == {"status": "match"}
+
+
+def test_check_resume_compatibility_no_metadata_for_legacy_checkpoint():
+    cfg = ExperimentConfig()
+
+    assert check_resume_compatibility(None, cfg) == {"status": "no_metadata"}
+    # "extra" present (as every checkpoint has always had) but without a
+    # "config" key - i.e. a checkpoint saved before this feature existed.
+    assert check_resume_compatibility({}, cfg) == {"status": "no_metadata"}
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="GradScaler forcibly disables itself (state_dict() == {}) when CUDA "
+    "is unavailable, regardless of enabled=True, so a non-trivial enabled "
+    "scaler state can only be exercised on real CUDA hardware",
+)
+def test_scaler_state_round_trips(tmp_path):
+    model = tiny_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    # Non-default construction args so this scaler's state is clearly
+    # different from a freshly-constructed default GradScaler's state -
+    # proves restoration actually happened, not just "defaults match
+    # defaults".
+    scaler = torch.cuda.amp.GradScaler(
+        init_scale=2.0 ** 5, growth_factor=1.5, backoff_factor=0.25,
+        growth_interval=50, enabled=True,
+    )
+    original_state = scaler.state_dict()
+
+    path = save_checkpoint(tmp_path, step=0, model=model, optimizer=optimizer, scaler=scaler)
+
+    model2 = tiny_model()
+    optimizer2 = torch.optim.AdamW(model2.parameters(), lr=1e-3)
+    scaler2 = torch.cuda.amp.GradScaler(enabled=True)  # plain defaults
+    assert scaler2.state_dict() != original_state, (
+        "test setup invalid: default scaler already matches the non-default one"
+    )
+
+    load_checkpoint(path, model2, optimizer2, scaler=scaler2)
+
+    assert scaler2.state_dict() == original_state
+
+
+def test_scaler_disabled_round_trip_is_a_no_op(tmp_path):
+    """On CPU-only training, the scaler is constructed with enabled=False;
+    its state_dict() is {} and restoring it must not raise or do anything
+    surprising."""
+    model = tiny_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scaler = torch.cuda.amp.GradScaler(enabled=False)
+
+    path = save_checkpoint(tmp_path, step=0, model=model, optimizer=optimizer, scaler=scaler)
+
+    model2 = tiny_model()
+    optimizer2 = torch.optim.AdamW(model2.parameters(), lr=1e-3)
+    scaler2 = torch.cuda.amp.GradScaler(enabled=False)
+
+    load_checkpoint(path, model2, optimizer2, scaler=scaler2)  # must not raise
+    assert scaler2.state_dict() == {}
+
+
+def test_load_checkpoint_backward_compatible_without_scaler_key(tmp_path):
+    """A checkpoint saved before scaler-state capture existed (no "scaler"
+    key at all) must still load without raising, even when a real scaler
+    is passed in to be restored."""
+    model = tiny_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+    legacy_state = {
+        "step": 4,
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": None,
+        "extra": {},
+    }
+    path = tmp_path / "ckpt_step4.pt"
+    torch.save(legacy_state, path)
+
+    model2 = tiny_model()
+    optimizer2 = torch.optim.AdamW(model2.parameters(), lr=1e-3)
+    scaler2 = torch.cuda.amp.GradScaler(
+        init_scale=2.0 ** 5, growth_factor=1.5, backoff_factor=0.25,
+        growth_interval=50, enabled=True,
+    )
+    pre_load_state = scaler2.state_dict()
+
+    state = load_checkpoint(path, model2, optimizer2, scaler=scaler2)  # must not raise
+
+    assert state["step"] == 4
+    # Nothing to restore from this legacy checkpoint - scaler2 untouched.
+    assert scaler2.state_dict() == pre_load_state

@@ -10,11 +10,21 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from afllm.checkpoint import find_latest_checkpoint, load_checkpoint, save_checkpoint
-from afllm.config import ExperimentConfig
-from afllm.env_checks import verify_training_paths
+from afllm.checkpoint import (
+    build_run_metadata,
+    check_resume_compatibility,
+    find_latest_checkpoint,
+    load_checkpoint,
+    save_checkpoint,
+)
+from afllm.config import ExperimentConfig, validate_train_config
+from afllm.env_checks import resolve_device, verify_training_paths
 from afllm.evaluate import evaluate
 from afllm.model import TransformerLM
+
+
+class EmptyTrainLoaderError(RuntimeError):
+    pass
 
 
 def cosine_lr(step: int, warmup_steps: int, max_steps: int, lr: float, min_lr: float) -> float:
@@ -40,15 +50,35 @@ def build_optimizer(model: torch.nn.Module, lr: float, weight_decay: float) -> t
     return torch.optim.AdamW(groups, lr=lr, betas=(0.9, 0.95))
 
 
+def resolve_amp_settings(device: str, amp_requested: bool) -> tuple[str, bool]:
+    """Returns (device_type, scaler_enabled) for a resolved device string
+    and the config's `amp` flag.
+
+    Uses `torch.device(device).type` - PyTorch's own parsing - rather than
+    comparing `device` against the literal string "cuda". That string
+    comparison previously left AMP silently disabled (and autocast
+    silently configured for "cpu") whenever `device` named a specific GPU
+    index like "cuda:0" rather than bare "cuda": `"cuda:0" == "cuda"` is
+    False, even though it's very much a CUDA device.
+    `torch.device("cuda:0").type` correctly returns "cuda" regardless of
+    index, and `torch.device("cpu").type` returns "cpu" - CPU-only
+    operation is unaffected.
+    """
+    device_type = torch.device(device).type
+    scaler_enabled = amp_requested and device_type == "cuda"
+    return device_type, scaler_enabled
+
+
 def train(cfg: ExperimentConfig, train_loader, val_loader, log_fn=print) -> dict:
     """Run training. `log_fn` receives a dict per logged step (so callers
     can route logs to a file, Colab cell output, etc).
 
     Returns the final log entry recorded, mainly for test/inspection.
     """
+    validate_train_config(cfg)
     verify_training_paths(cfg)
 
-    device = cfg.train.device if torch.cuda.is_available() else "cpu"
+    device = resolve_device(cfg.train.device)
     random.seed(cfg.train.seed)
     np.random.seed(cfg.train.seed)
     torch.manual_seed(cfg.train.seed)
@@ -57,18 +87,45 @@ def train(cfg: ExperimentConfig, train_loader, val_loader, log_fn=print) -> dict
 
     model = TransformerLM(cfg.model).to(device)
     optimizer = build_optimizer(model, cfg.train.lr, cfg.train.weight_decay)
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg.train.amp and device == "cuda")
+    device_type, scaler_enabled = resolve_amp_settings(device, cfg.train.amp)
+    scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
 
     start_step = 0
     if cfg.train.resume:
         latest = find_latest_checkpoint(cfg.train.checkpoint_dir)
         if latest is not None:
-            state = load_checkpoint(latest, model, optimizer, map_location=device)
+            state = load_checkpoint(latest, model, optimizer, scaler=scaler, map_location=device)
             start_step = state["step"] + 1
-            log_fn({"event": "resumed", "from_checkpoint": str(latest), "step": start_step})
+            # Surface config-mismatch status explicitly rather than
+            # silently treating any resume as a verified exact one - see
+            # afllm.checkpoint.check_resume_compatibility for what counts
+            # as a critical mismatch vs. a benign environment difference.
+            compatibility = check_resume_compatibility(state.get("extra"), cfg)
+            log_fn({
+                "event": "resumed",
+                "from_checkpoint": str(latest),
+                "step": start_step,
+                "resume_compatibility": compatibility,
+            })
 
     Path(cfg.train.log_dir).mkdir(parents=True, exist_ok=True)
     last_log: dict = {}
+
+    # Fail fast and clearly if the training set produced zero batches
+    # (e.g. too short for the configured seq_len/batch_size), rather than
+    # discovering it only once the loop below re-iterates and finds
+    # nothing either.
+    try:
+        train_loader_len = len(train_loader)
+    except TypeError:
+        train_loader_len = None  # an iterable without a defined length
+    if train_loader_len == 0:
+        raise EmptyTrainLoaderError(
+            "train_loader produced zero batches - cannot train. Check that "
+            "the training dataset is large enough for the configured "
+            "seq_len and batch_size (see TokenBlockDataset)."
+        )
+
     train_iter = iter(train_loader)
 
     for step in range(start_step, cfg.train.max_steps):
@@ -87,13 +144,26 @@ def train(cfg: ExperimentConfig, train_loader, val_loader, log_fn=print) -> dict
                 x, y = next(train_iter)
             except StopIteration:
                 train_iter = iter(train_loader)
-                x, y = next(train_iter)
+                try:
+                    x, y = next(train_iter)
+                except StopIteration:
+                    # Re-iterating produced nothing either - the loader
+                    # has become empty (or always was, and the upfront
+                    # len() check above didn't catch it, e.g. an iterable
+                    # without __len__). Fail with a clear error instead of
+                    # letting a bare StopIteration escape this function
+                    # and propagate as a confusing crash to the caller.
+                    raise EmptyTrainLoaderError(
+                        "train_loader produced zero batches on "
+                        "re-iteration at step "
+                        f"{step} - cannot continue training."
+                    ) from None
             x, y = x.to(device), y.to(device)
 
             with torch.autocast(
-                device_type="cuda" if device == "cuda" else "cpu",
+                device_type=device_type,
                 enabled=cfg.train.amp,
-                dtype=torch.float16 if device == "cuda" else torch.bfloat16,
+                dtype=torch.float16 if device_type == "cuda" else torch.bfloat16,
             ):
                 _, loss = model(x, y)
                 loss = loss / cfg.train.grad_accum_steps
@@ -115,12 +185,22 @@ def train(cfg: ExperimentConfig, train_loader, val_loader, log_fn=print) -> dict
 
         if step % cfg.train.eval_interval == 0 or step == cfg.train.max_steps - 1:
             metrics = evaluate(model, val_loader, device, max_steps=cfg.train.eval_steps)
-            last_log["val_loss"] = metrics["loss"]
-            last_log["val_perplexity"] = metrics["perplexity"]
+            if metrics["valid"]:
+                last_log["val_loss"] = metrics["loss"]
+                last_log["val_perplexity"] = metrics["perplexity"]
+            else:
+                # Never let an invalid eval (e.g. empty validation set)
+                # flow into logs as NaN - record an explicit status instead
+                # of a number that looks real but isn't.
+                last_log["val_status"] = "no_validation_data"
 
         log_fn(last_log)
 
         if step % cfg.train.checkpoint_interval == 0 or step == cfg.train.max_steps - 1:
-            save_checkpoint(cfg.train.checkpoint_dir, step, model, optimizer)
+            save_checkpoint(
+                cfg.train.checkpoint_dir, step, model, optimizer,
+                scaler=scaler,
+                extra=build_run_metadata(cfg, step),
+            )
 
     return last_log
