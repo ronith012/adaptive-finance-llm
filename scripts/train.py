@@ -14,7 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from afllm.config import load_config, validate_vocab_size  # noqa: E402
+from afllm.config import load_config  # noqa: E402
 from afllm.data import load_wikitext2, make_loaders  # noqa: E402
 from afllm.env_checks import verify_training_paths  # noqa: E402
 from afllm.train import train  # noqa: E402
@@ -29,13 +29,12 @@ def main() -> None:
     verify_training_paths(cfg)
 
     corpus = load_wikitext2(cfg.data)
-    validate_vocab_size(cfg, corpus.vocab_size)
     train_loader, val_loader = make_loaders(corpus, cfg.data, cfg.train.batch_size)
 
     def log_fn(entry: dict) -> None:
         print(json.dumps(entry))
 
-    train(cfg, train_loader, val_loader, log_fn=log_fn)
+    train(cfg, train_loader, val_loader, tokenizer_vocab_size=corpus.vocab_size, log_fn=log_fn)
 
 
 if __name__ == "__main__":

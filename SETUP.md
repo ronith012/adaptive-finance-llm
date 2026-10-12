@@ -55,7 +55,7 @@ the Colab session itself.
    test, so it's skipped here too:
 
    ```python
-   !pip install -q numpy pyyaml datasets tokenizers tqdm transformers
+   !pip install -q numpy pyyaml datasets tokenizers tqdm "transformers>=4.40,<5"
    ```
 
    Then confirm the GPU is actually visible to torch before doing anything

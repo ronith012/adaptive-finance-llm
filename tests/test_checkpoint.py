@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from afllm.checkpoint import (
+    CheckpointConfigMismatchError,
     _restore_rng_state,
     build_run_metadata,
     check_resume_compatibility,
@@ -419,3 +420,72 @@ def test_load_checkpoint_backward_compatible_without_scaler_key(tmp_path):
     assert state["step"] == 4
     # Nothing to restore from this legacy checkpoint - scaler2 untouched.
     assert scaler2.state_dict() == pre_load_state
+
+
+def _experiment_cfg_for(model_cfg: ModelConfig) -> ExperimentConfig:
+    return ExperimentConfig(model=model_cfg)
+
+
+def test_load_checkpoint_rejects_incompatible_config_before_loading_weights(tmp_path):
+    saved_cfg = _experiment_cfg_for(
+        ModelConfig(vocab_size=97, dim=32, n_layers=2, n_heads=4, n_kv_heads=2, max_seq_len=16)
+    )
+    model = TransformerLM(saved_cfg.model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    path = save_checkpoint(
+        tmp_path, step=0, model=model, optimizer=optimizer,
+        extra=build_run_metadata(saved_cfg, step=0),
+    )
+
+    # A critically different model (different dim) - architecturally
+    # incompatible with the saved weights.
+    mismatched_cfg = _experiment_cfg_for(
+        ModelConfig(vocab_size=97, dim=64, n_layers=2, n_heads=4, n_kv_heads=2, max_seq_len=16)
+    )
+    model2 = TransformerLM(mismatched_cfg.model)
+    original_param = next(model2.parameters()).detach().clone()
+
+    with pytest.raises(CheckpointConfigMismatchError, match="model.dim"):
+        load_checkpoint(path, model2, optimizer=None, require_compatible_config=mismatched_cfg)
+
+    # The mismatch must be caught before any weights were applied.
+    assert torch.equal(next(model2.parameters()), original_param), (
+        "model parameters changed even though loading should have been "
+        "refused before load_state_dict ran"
+    )
+
+
+def test_load_checkpoint_allows_matching_config(tmp_path):
+    cfg = _experiment_cfg_for(
+        ModelConfig(vocab_size=97, dim=32, n_layers=2, n_heads=4, n_kv_heads=2, max_seq_len=16)
+    )
+    model = TransformerLM(cfg.model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    path = save_checkpoint(
+        tmp_path, step=0, model=model, optimizer=optimizer,
+        extra=build_run_metadata(cfg, step=0),
+    )
+
+    model2 = TransformerLM(cfg.model)
+    state = load_checkpoint(path, model2, optimizer=None, require_compatible_config=cfg)
+
+    assert state["step"] == 0
+    for p1, p2 in zip(model.parameters(), model2.parameters()):
+        assert torch.equal(p1, p2)
+
+
+def test_load_checkpoint_with_require_compatible_config_still_allows_legacy_checkpoint(tmp_path):
+    """A checkpoint with no run metadata at all ("no_metadata") can't be
+    verified either way - it must not be treated as a confirmed mismatch,
+    even when require_compatible_config is set."""
+    model = tiny_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    path = save_checkpoint(tmp_path, step=0, model=model, optimizer=optimizer)  # no extra=
+
+    model2 = tiny_model()
+    cfg = ExperimentConfig()
+    state = load_checkpoint(path, model2, optimizer=None, require_compatible_config=cfg)  # must not raise
+
+    assert state["step"] == 0
+    for p1, p2 in zip(model.parameters(), model2.parameters()):
+        assert torch.equal(p1, p2)

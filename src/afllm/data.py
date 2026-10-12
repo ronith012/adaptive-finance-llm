@@ -85,3 +85,19 @@ def make_loaders(corpus: TokenizedCorpus, cfg: DataConfig, batch_size: int):
         num_workers=cfg.num_workers, drop_last=True,
     )
     return train_loader, val_loader
+
+
+def make_test_loader(corpus: TokenizedCorpus, cfg: DataConfig, batch_size: int):
+    """A loader over the held-out test split, built the same way as
+    `make_loaders`' val_loader (unshuffled, drop_last=True). Deliberately
+    separate from `make_loaders` - this loader is for a one-time, final
+    evaluation run (see `scripts/evaluate_test.py`), never for anything
+    `train()` touches, so test-set metrics can't influence training
+    decisions or hyperparameter choices."""
+    from torch.utils.data import DataLoader
+
+    test_ds = TokenBlockDataset(corpus.test, cfg.seq_len)
+    return DataLoader(
+        test_ds, batch_size=batch_size, shuffle=False,
+        num_workers=cfg.num_workers, drop_last=True,
+    )
