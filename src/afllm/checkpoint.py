@@ -261,6 +261,10 @@ def find_latest_checkpoint(checkpoint_dir: str | Path) -> Path | None:
     return candidates[-1][1]
 
 
+class CheckpointConfigMismatchError(RuntimeError):
+    pass
+
+
 def load_checkpoint(
     path: str | Path,
     model: torch.nn.Module,
@@ -269,7 +273,24 @@ def load_checkpoint(
     scaler: torch.cuda.amp.GradScaler | None = None,
     map_location: str = "cpu",
     restore_rng: bool = True,
+    require_compatible_config: ExperimentConfig | None = None,
 ) -> dict:
+    """Load a checkpoint. If `require_compatible_config` is given, the
+    checkpoint's saved config (see `build_run_metadata`/`check_resume_compatibility`)
+    is checked against it *before* any weights are applied to `model` -
+    raising `CheckpointConfigMismatchError` on a confirmed critical-field
+    mismatch, so a config/architecture mismatch is never silently loaded
+    into the model. A `"no_metadata"` result (a checkpoint saved before
+    this feature existed) is not treated as an error here either - it
+    means compatibility cannot be verified, not that it's known-bad.
+
+    This is distinct from, and does not change, `train()`'s own resume
+    path, which never passes `require_compatible_config` and instead only
+    logs the comparison result (see `train.py`) - resuming an existing
+    training run should warn on mismatch but never block; a one-off,
+    final test-set evaluation (see `scripts/evaluate_test.py`) should
+    refuse outright instead.
+    """
     # weights_only=False: our checkpoints carry optimizer state and RNG
     # state (NumPy's RNG state tuple, Python's random state) alongside
     # tensors, which torch's default `weights_only=True` unpickler refuses
@@ -278,6 +299,13 @@ def load_checkpoint(
     # file from an untrusted source, since this path can execute arbitrary
     # code during unpickling.
     state = torch.load(path, map_location=map_location, weights_only=False)
+    if require_compatible_config is not None:
+        compatibility = check_resume_compatibility(state.get("extra"), require_compatible_config)
+        if compatibility["status"] == "mismatch":
+            raise CheckpointConfigMismatchError(
+                f"Checkpoint {path} is not compatible with the current "
+                f"configuration:\n  - " + "\n  - ".join(compatibility["mismatches"])
+            )
     model.load_state_dict(state["model"])
     if optimizer is not None and state.get("optimizer") is not None:
         optimizer.load_state_dict(state["optimizer"])
